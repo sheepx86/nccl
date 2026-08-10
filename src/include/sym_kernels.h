@@ -52,6 +52,8 @@ enum ncclSymkKernelId {
   ncclSymkKernelId_ReduceScatter_RailA2A_LsaLD,
   ncclSymkKernelId_ReduceScatter_RailA2A_LsaLDMC,
 
+  ncclSymkKernelId_AlltoAll_FullGin_LsaST,
+
   ncclSymkKernelId_Count
 };
 
@@ -74,7 +76,8 @@ constexpr char const* ncclSymKernelStr[] = {
   "ReduceScatter_LD",
   "ReduceScatter_LDMC",
   "ReduceScatter_RailA2A_LsaLD",
-  "ReduceScatter_RailA2A_LsaLDMC"
+  "ReduceScatter_RailA2A_LsaLDMC",
+  "AlltoAll_FullGin_LsaST"
 };
 
 struct ncclSymkDevComm {
@@ -94,9 +97,11 @@ struct ncclSymkDevComm {
 
 struct ncclSymkState {
   bool initialized;
+  bool a2aInitialized;
   bool hasLsaMultimem;
   int maxGinInboxBlocks;
   struct ncclSymkDevComm kcomm;
+  struct ncclSymkDevComm a2aKcomm;
 };
 
 struct ncclSymkChannelWorkRange {
@@ -158,10 +163,13 @@ typedef enum {
 
 // We assume ncclComm contains a field: `ncclSymkState symkState`
 ncclResult_t ncclSymkInitOnce(struct ncclComm* comm);
+ncclResult_t ncclSymkA2aInitOnce(struct ncclComm* comm);
 ncclResult_t ncclSymkFinalize(struct ncclComm* comm);
 
 bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedOp_t*/ red, ncclDataType_t ty,
                        size_t nElts);
+bool ncclSymkA2aAvailable(struct ncclComm* comm, void const* sendbuff, void* recvbuff, size_t bytesPerPeer);
+int ncclSymkA2aChannels(struct ncclComm* comm, size_t bytesPerPeer, int minCTAs, int maxCTAs);
 uint32_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedOp_t*/ red, ncclDataType_t ty,
                       size_t nElts, bool symAligned16B = true);
 
@@ -189,6 +197,7 @@ int ncclSymkGinKernelMask();
 int ncclSymkAGKernelMask();
 int ncclSymkARKernelMask();
 int ncclSymkRSKernelMask();
+int ncclSymkA2AKernelMask();
 size_t ncclSymkRsGinChunkBytes();
 
 constexpr int ncclSymkAllGather_RailRing_ChunkSize = 1 << 20;

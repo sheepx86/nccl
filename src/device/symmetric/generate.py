@@ -57,7 +57,7 @@ class Rec(object):
 reductions = ["AllReduce","ReduceScatter"]
 all_reds = ["sum", "avg"]
 all_tys = ["f32","f16","bf16","f8e4m3","f8e5m2"]
-gin_algos = ["RailA2A_LsaLD", "RailA2A_LsaLDMC", "RailRing_LsaSTMC"]
+gin_algos = ["RailA2A_LsaLD", "RailA2A_LsaLDMC", "RailRing_LsaSTMC", "FullGin_LsaST"]
 tma_algos = ["TmaST", "TmaSTMC", "TmaLD", "RSxTmaLD_AGxTmaST"]
 
 nvls_algos_by_coll = {
@@ -69,7 +69,8 @@ ldmc_algos = ["RSxLDMC_AGxSTMC", "LDMC", "RailA2A_LsaLDMC"]
 coll_to_lower = {
   "AllGather": "all_gather",
   "AllReduce": "all_reduce",
-  "ReduceScatter": "reduce_scatter"
+  "ReduceScatter": "reduce_scatter",
+  "AlltoAll": "all_to_all"
 }
 
 red_to_ncclDevRedOp = {
@@ -99,6 +100,7 @@ ty_to_cxxtype = {
 def enumerate_kernels():
   for algo in ["LL","LLMC","ST","STMC","TmaST","TmaSTMC","RailRing_LsaSTMC"]:
     yield Rec(coll="AllGather", algo=algo)
+  yield Rec(coll="AlltoAll", algo="FullGin_LsaST")
   for red in all_reds:
     for ty in all_tys:
       for algo in ["AGxLL_R","AGxLLMC_R","RSxLD_AGxST","RSxLDMC_AGxSTMC","RSxTmaLD_AGxTmaST"]:
@@ -375,4 +377,3 @@ if os.environ.get("NCCL_USE_CMAKE", "0") != "1":
           "\n"
           .format(src=src, fbase=fbase, gencode=gencode)
         )
-

@@ -128,6 +128,8 @@ static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
     return nRanks;
   case ncclFuncReduceScatter:
     return nRanks;
+  case ncclFuncAlltoAll:
+    return nRanks;
   default:
     return 1;
   }
@@ -2743,7 +2745,7 @@ static ncclResult_t collTaskAppend(struct ncclComm* comm, struct ncclInfo* info,
     t->root = info->root;
     t->datatype = info->datatype;
     size_t elementSize = ncclTypeSize(t->datatype);
-    if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast) {
+    if (t->func == ncclFuncAllGather || t->func == ncclFuncBroadcast || t->func == ncclFuncAlltoAll) {
       t->count *= elementSize;
       t->datatype = ncclInt8;
       elementSize = 1;
@@ -3320,24 +3322,32 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
         NCCLCHECK(ncclCudaGetCapturingGraph(&graph, info->stream, comm->config.graphUsageMode));
         captured = ncclCudaGraphValid(graph);
         if (info->coll == ncclFuncAlltoAll) {
-          bool sendLocalValid = false;
-          bool recvLocalValid = false;
-          NCCLCHECK(ncclRegFind(comm, info->sendbuff, comm->nRanks * info->count * ncclTypeSize(info->datatype),
-                                &sendReg));
-          NCCLCHECK(ncclRegFind(comm, info->recvbuff, comm->nRanks * info->count * ncclTypeSize(info->datatype),
-                                &recvReg));
-          if (sendReg) NCCLCHECK(ncclRegLocalIsValid(sendReg, &sendLocalValid));
-          if (recvReg) NCCLCHECK(ncclRegLocalIsValid(recvReg, &recvLocalValid));
-          // In non-captured mode, UB requires local-valid registration on both
-          // sides; graph-only registration visibility must not enable UB.
-          allowUB = captured || (sendLocalValid && recvLocalValid);
-          for (int r = 0; r < comm->nRanks; r++) {
-            NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI,
-                                    (void*)((char*)info->sendbuff + r * info->count * ncclTypeSize(info->datatype)),
-                                    info->count, info->datatype, r, allowUB));
-            NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI,
-                                    (void*)((char*)info->recvbuff + r * info->count * ncclTypeSize(info->datatype)),
-                                    info->count, info->datatype, r, allowUB));
+          size_t bytesPerPeer = info->count * ncclTypeSize(info->datatype);
+          bool selectionAllowsSym = algMask == 0 || (algMask & NCCL_TUNING_MASK_SYM_KERNELS) != 0;
+          if (selectionAllowsSym && ncclSymkA2aAvailable(comm, info->sendbuff, info->recvbuff, bytesPerPeer)) {
+            NCCLCHECK(collTaskAppend(comm, info, opDev));
+          } else {
+            if (algMask != 0 && info->collConfig.forceAlgSelection) {
+              WARN("algSelection names only symmetric kernel(s) that are unavailable for AlltoAll");
+              return ncclInvalidArgument;
+            }
+            bool sendLocalValid = false;
+            bool recvLocalValid = false;
+            NCCLCHECK(ncclRegFind(comm, info->sendbuff, comm->nRanks * bytesPerPeer, &sendReg));
+            NCCLCHECK(ncclRegFind(comm, info->recvbuff, comm->nRanks * bytesPerPeer, &recvReg));
+            if (sendReg) NCCLCHECK(ncclRegLocalIsValid(sendReg, &sendLocalValid));
+            if (recvReg) NCCLCHECK(ncclRegLocalIsValid(recvReg, &recvLocalValid));
+            // In non-captured mode, UB requires local-valid registration on both
+            // sides; graph-only registration visibility must not enable UB.
+            allowUB = captured || (sendLocalValid && recvLocalValid);
+            for (int r = 0; r < comm->nRanks; r++) {
+              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncSend, collAPI,
+                                      (void*)((char*)info->sendbuff + r * bytesPerPeer), info->count, info->datatype, r,
+                                      allowUB));
+              NCCLCHECK(p2pTaskAppend(comm, info, ncclFuncRecv, collAPI,
+                                      (void*)((char*)info->recvbuff + r * bytesPerPeer), info->count, info->datatype, r,
+                                      allowUB));
+            }
           }
         } else if (info->coll == ncclFuncGather) {
           size_t offset = 0;

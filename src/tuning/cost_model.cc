@@ -271,9 +271,12 @@ Enable order: Broadcast, Reduce, AllGather, ReduceScatter, AllReduce
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 0, 1, 0}}, // ReduceScatter_LDMC
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 0, 1, 0}}, // ReduceScatter_RailA2A_LsaLD
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 0, 1, 0}}, // ReduceScatter_RailA2A_LsaLDMC
+  // AlltoAll is selected by its dedicated fast-path picker because it is outside NCCL_NUM_FUNCTIONS.
+  {nullptr, nullptr, nullptr, {0}}, // AlltoAll_FullGin_LsaST
   {nullptr, ncclTuningCeModelSim, nullptr, {0, 0, 1, 0, 0}}, // CE AllGather Unicast
   {nullptr, ncclTuningCeModelSim, nullptr, {0, 0, 1, 0, 0}}, // CE AllGather Multicast
 };
+static_assert(sizeof(modelMap) / sizeof(modelMap[0]) == NCCL_TUNING_COUNT, "modelMap must match tuning ids");
 
 /*
   Get a model entry from the model map.

@@ -43,6 +43,8 @@ constexpr uint32_t kernelMask_RS = 1 << ncclSymkKernelId_ReduceScatter_LD | 1 <<
                                    1 << ncclSymkKernelId_ReduceScatter_RailA2A_LsaLD |
                                    1 << ncclSymkKernelId_ReduceScatter_RailA2A_LsaLDMC;
 
+constexpr uint32_t kernelMask_A2A = 1 << ncclSymkKernelId_AlltoAll_FullGin_LsaST;
+
 constexpr uint32_t kernelMask_LSA =
   1 << ncclSymkKernelId_AllReduce_AGxLL_R | 1 << ncclSymkKernelId_AllReduce_AGxLLMC_R |
   1 << ncclSymkKernelId_AllReduce_RSxLD_AGxST | 1 << ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
@@ -54,7 +56,8 @@ constexpr uint32_t kernelMask_LSA =
 
 constexpr uint32_t kernelMask_Gin = 1 << ncclSymkKernelId_ReduceScatter_RailA2A_LsaLD |
                                     1 << ncclSymkKernelId_ReduceScatter_RailA2A_LsaLDMC |
-                                    1 << ncclSymkKernelId_AllGather_RailRing_LsaSTMC;
+                                    1 << ncclSymkKernelId_AllGather_RailRing_LsaSTMC |
+                                    kernelMask_A2A;
 
 constexpr uint32_t kernelMask_Tma = 1 << ncclSymkKernelId_AllGather_TmaST | 1 << ncclSymkKernelId_AllGather_TmaSTMC |
                                     1 << ncclSymkKernelId_AllReduce_RSxTmaLD_AGxTmaST |
@@ -86,6 +89,10 @@ int ncclSymkARKernelMask() {
 
 int ncclSymkRSKernelMask() {
   return kernelMask_RS;
+}
+
+int ncclSymkA2AKernelMask() {
+  return kernelMask_A2A;
 }
 
 // Host picker: true when nBytes is large enough for this kernel's TMA deep loop at nBlocks.
@@ -123,6 +130,8 @@ static uint32_t kernelMask_coll(ncclFunc_t coll) {
     return kernelMask_AR;
   case ncclFuncReduceScatter:
     return kernelMask_RS;
+  case ncclFuncAlltoAll:
+    return kernelMask_A2A;
   default:
     return 0;
   }
@@ -131,6 +140,7 @@ static uint32_t kernelMask_coll(ncclFunc_t coll) {
 NCCL_PARAM(SymGinKernelsEnable, "SYM_GIN_KERNELS_ENABLE", 1)
 NCCL_PARAM(SymRsGinChunkSize, "SYM_RS_GIN_CHUNK_SIZE", -1)
 NCCL_PARAM(SymTmaEnable, "SYM_TMA_ENABLE", 1)
+NCCL_PARAM(SymA2aCTAs, "SYM_A2A_CTAS", -1)
 
 bool ncclSymkTmaAvailable(struct ncclComm* comm) {
   // TMA requires up to (8KB data + 8B mbarrier + alignment) x 16 warps SMEM.
@@ -263,8 +273,38 @@ ncclResult_t ncclSymkInitOnce(struct ncclComm* comm) {
   return ncclSuccess;
 }
 
+ncclResult_t ncclSymkA2aInitOnce(struct ncclComm* comm) {
+  struct ncclSymkState* symk = &comm->symkState;
+  if (symk->a2aInitialized) return ncclSuccess;
+  if (comm->globalGinSupport != NCCL_GIN_CONNECTION_FULL) return ncclInvalidUsage;
+
+  NCCLCHECK(ncclDevrInitOnce(comm));
+
+  struct ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  struct ncclDevResourceRequirements signalReq = {};
+  signalReq.ginSignalCount = ncclSymkMaxBlocks;
+  signalReq.outGinSignalStart = &symk->a2aKcomm.ginSyncHandle.railSignals;
+  reqs.resourceRequirementsList = &signalReq;
+  reqs.barrierCount = ncclSymkMaxBlocks;
+  reqs.ginContextCount = 16;
+  reqs.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+  reqs.ginQueueDepth = 1024;
+  reqs.ginVaSignalsRequired = false;
+
+  NCCLCHECK(ncclDevrCommCreateInternal(comm, &reqs, &symk->a2aKcomm.devComm, /*isInternal=*/true,
+                                       /*deviceCodeVersion=*/NCCL_VERSION_CODE));
+  symk->a2aKcomm.workStarted = comm->profiler.symWorkStarted;
+  symk->a2aKcomm.workCompleted = comm->profiler.symWorkCompleted;
+  symk->a2aKcomm.workPhases = comm->profiler.symWorkPhases;
+  symk->a2aInitialized = true;
+  return ncclSuccess;
+}
+
 ncclResult_t ncclSymkFinalize(struct ncclComm* comm) {
   struct ncclSymkState* symk = &comm->symkState;
+  if (symk->a2aInitialized) {
+    NCCLCHECK(ncclDevCommDestroy(comm, &symk->a2aKcomm.devComm));
+  }
   if (symk->initialized) {
     NCCLCHECK(ncclDevCommDestroy(comm, &symk->kcomm.devComm));
   }
@@ -289,6 +329,7 @@ static bool ncclSymkImplemented(ncclFunc_t coll, int /*ncclDevRedOp_t*/ red, ncc
 
   switch (coll) {
   case ncclFuncAllGather:
+  case ncclFuncAlltoAll:
     return true;
   case ncclFuncAllReduce:
   case ncclFuncReduceScatter:
@@ -332,8 +373,11 @@ uint32_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedOp
   if (!hasSTMC) kmask &= ~kernelMask_STMC;
   if (!hasLDMC) kmask &= ~kernelMask_LDMC;
 
-  size_t nBytes = alignUp(nElts * ncclTypeSize(ty), NCCL_SYM_KERNEL_CELL_SIZE);
-  size_t nBusBytes = (coll == ncclFuncAllReduce ? 1 : comm->nRanks) * nBytes;
+  size_t eltSize = ncclTypeSize(ty);
+  if (nElts > (SIZE_MAX - (NCCL_SYM_KERNEL_CELL_SIZE - 1)) / eltSize) return 0;
+  size_t nBytes = alignUp(nElts * eltSize, NCCL_SYM_KERNEL_CELL_SIZE);
+  size_t busRanks = coll == ncclFuncAllReduce ? 1 : comm->nRanks;
+  size_t nBusBytes = nBytes > SIZE_MAX / busRanks ? SIZE_MAX : busRanks * nBytes;
   // LL kernels use 32-bit ints to track element counts and indices.
   if (nBusBytes >= (size_t(2) << 30)) kmask &= ~kernelMask_LL;
   // Any kernel might use 32-bit int to track unrolled loop chunks (which are going
@@ -345,6 +389,7 @@ uint32_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedOp
 
   bool hasGin = ncclParamSymGinKernelsEnable() != 0;
   if (!hasGin) kmask &= ~kernelMask_Gin;
+  if (coll == ncclFuncAlltoAll && comm->globalGinSupport != NCCL_GIN_CONNECTION_FULL) kmask = 0;
   bool needGin = ncclTeamLsa(comm).nRanks < comm->nRanks;
   kmask &= needGin ? kernelMask_Gin : ~kernelMask_Gin;
   return kmask;
@@ -356,6 +401,39 @@ bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedO
   if (!ncclSymkImplemented(coll, red, ty)) return false;
 
   return (ncclSymkMask(comm, coll, red, ty, nElts) != 0);
+}
+
+bool ncclSymkA2aAvailable(struct ncclComm* comm, void const* sendbuff, void* recvbuff, size_t bytesPerPeer) {
+  if (bytesPerPeer == 0 || sendbuff == recvbuff) return false;
+  if (!ncclSymkAvailable(comm, ncclFuncAlltoAll, ncclDevSum, ncclInt8, bytesPerPeer)) return false;
+
+  struct ncclDevrWindow* sendWin = nullptr;
+  struct ncclDevrWindow* recvWin = nullptr;
+  if (ncclDevrFindWindow(comm, sendbuff, &sendWin) != ncclSuccess ||
+      ncclDevrFindWindow(comm, recvbuff, &recvWin) != ncclSuccess) {
+    return false;
+  }
+  if (sendWin == nullptr || recvWin == nullptr) return false;
+  if (!(sendWin->winFlags & NCCL_WIN_COLL_SYMMETRIC) || !(recvWin->winFlags & NCCL_WIN_COLL_SYMMETRIC)) return false;
+  if (ncclDevrWindowHasSysmemSegment(sendWin) || ncclDevrWindowHasSysmemSegment(recvWin)) return false;
+
+  if (bytesPerPeer > SIZE_MAX / (size_t)comm->nRanks) return false;
+  size_t totalBytes = bytesPerPeer * (size_t)comm->nRanks;
+  size_t sendOff = (uintptr_t)sendbuff - (uintptr_t)sendWin->userPtr;
+  size_t recvOff = (uintptr_t)recvbuff - (uintptr_t)recvWin->userPtr;
+  return sendOff <= sendWin->size && totalBytes <= sendWin->size - sendOff && recvOff <= recvWin->size &&
+         totalBytes <= recvWin->size - recvOff;
+}
+
+int ncclSymkA2aChannels(struct ncclComm* comm, size_t bytesPerPeer, int minCTAs, int maxCTAs) {
+  constexpr size_t targetBytesPerCta = 4 << 20;
+  size_t totalBytes = bytesPerPeer > SIZE_MAX / (size_t)comm->nRanks ? SIZE_MAX : bytesPerPeer * comm->nRanks;
+  size_t wanted = divUp(totalBytes, targetBytesPerCta);
+  int nChannels = (int)std::min<size_t>(std::max<size_t>(wanted, 1), 16);
+  if (ncclParamSymA2aCTAs() >= 1) nChannels = ncclParamSymA2aCTAs();
+  nChannels = std::max(nChannels, minCTAs);
+  nChannels = std::min(nChannels, maxCTAs);
+  return std::max(1, std::min(nChannels, ncclSymkMaxBlocks));
 }
 
 const char* ncclSymkKernelIdToString(int kernelId) {

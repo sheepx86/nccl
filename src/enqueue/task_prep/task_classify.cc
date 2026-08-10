@@ -137,6 +137,12 @@ ncclResult_t ncclTaskClassification(struct ncclComm* comm, struct ncclTaskTuning
     tInfo = ncclIntruQueueDequeue(&tiq->queue);
     if (tInfo->raw == nullptr) return ncclInternalError;
 
+    if (tInfo->raw->kind == ncclTaskKindColl && tInfo->raw->coll.func == ncclFuncAlltoAll &&
+        taskUsesSymKernel(tInfo)) {
+      ncclIntruQueueEnqueue(&ctq->symTaskQueue, tInfo);
+      continue;
+    }
+
     if (tInfo->raw->kind == ncclTaskKindColl &&
         (tInfo->raw->coll.func == ncclFuncAlltoAll || tInfo->raw->coll.func == ncclFuncScatter ||
          tInfo->raw->coll.func == ncclFuncGather)) {

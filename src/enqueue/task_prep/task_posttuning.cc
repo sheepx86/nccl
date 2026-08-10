@@ -42,6 +42,8 @@ static inline int ncclFuncTrafficPerByte(ncclFunc_t func, int nRanks) {
     return nRanks;
   case ncclFuncReduceScatter:
     return nRanks;
+  case ncclFuncAlltoAll:
+    return nRanks;
   default:
     return 1;
   }
@@ -97,7 +99,7 @@ static ncclResult_t fillCollTaskFromRaw(struct ncclComm* comm, struct ncclTaskTu
   task->root = raw->root;
   task->datatype = raw->datatype;
   size_t elementSize = ncclTypeSize(task->datatype);
-  if (task->func == ncclFuncAllGather || task->func == ncclFuncBroadcast) {
+  if (task->func == ncclFuncAllGather || task->func == ncclFuncBroadcast || task->func == ncclFuncAlltoAll) {
     task->count *= elementSize;
     task->datatype = ncclInt8;
     elementSize = 1;
@@ -271,7 +273,18 @@ static ncclResult_t postTuneTasksDebug(struct ncclComm* comm) {
 static ncclResult_t postTuneSymTasksLazyInit(
   struct ncclComm* comm, struct ncclIntruQueue<struct ncclTaskTuningInfo, &ncclTaskTuningInfo::next>* symTaskQueue) {
   if (ncclIntruQueueEmpty(symTaskQueue)) return ncclSuccess;
-  return ncclSymkInitOnce(comm);
+  bool needDefault = false;
+  bool needA2a = false;
+  for (struct ncclTaskTuningInfo* t = ncclIntruQueueHead(symTaskQueue); t != nullptr; t = t->next) {
+    if (t->tuningOut.symKernelId == ncclSymkKernelId_AlltoAll_FullGin_LsaST) {
+      needA2a = true;
+    } else {
+      needDefault = true;
+    }
+  }
+  if (needDefault) NCCLCHECK(ncclSymkInitOnce(comm));
+  if (needA2a) NCCLCHECK(ncclSymkA2aInitOnce(comm));
+  return ncclSuccess;
 }
 
 static ncclResult_t postTuneRmaFreeTuningInfoRaw(struct ncclComm* comm, struct ncclTaskTuningInfo* tInfo) {

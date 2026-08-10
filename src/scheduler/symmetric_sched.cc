@@ -97,9 +97,13 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
     struct ncclTaskColl* next = task->next;
     ncclDevRedOp_t symkOp = symkRedOp(task->opHost, task->opDev.op);
     bool symAvailable = ncclSymkAvailable(comm, task->func, symkOp, task->datatype, task->count);
+    if (task->func == ncclFuncAlltoAll) {
+      symAvailable = ncclSymkA2aAvailable(comm, task->sendbuff, task->recvbuff, task->count);
+    }
     // Env (NCCL_ALGO/PROTO/SYM_KERNEL) is a global override that wins over per-call
     // algSelection for any function it forced.
-    uint64_t effAlgMask = comm->tuningContext.forced[task->func] ? 0 : task->algMask;
+    uint64_t effAlgMask =
+      task->func < NCCL_NUM_FUNCTIONS && comm->tuningContext.forced[task->func] ? 0 : task->algMask;
     bool cfgAllowsSymk = (effAlgMask == 0) || ((effAlgMask & NCCL_TUNING_MASK_SYM_KERNELS) != 0);
 
     if (symAvailable && cfgAllowsSymk) {
@@ -168,42 +172,51 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
         }
         task = task->next;
       }
-      struct ncclTuningInput_t input;
-      input.comm = comm;
-      input.tuningMask = NCCL_TUNING_MASK_SYM_KERNELS;
       // Env (NCCL_ALGO/PROTO/SYM_KERNEL) is a global override that wins over per-call
       // algSelection for any function it forced.
-      uint64_t effAlgMask = comm->tuningContext.forced[headTask->func] ? 0 : headTask->algMask;
-      if (effAlgMask != 0) {
-        uint64_t symkMask = effAlgMask & NCCL_TUNING_MASK_SYM_KERNELS;
-        if (symkMask != 0) input.tuningMask = symkMask;
+      uint64_t effAlgMask = headTask->func < NCCL_NUM_FUNCTIONS && comm->tuningContext.forced[headTask->func] ?
+                              0 :
+                              headTask->algMask;
+      if (headTask->func == ncclFuncAlltoAll) {
+        NCCLCHECK(ncclSymkA2aInitOnce(comm));
+        kernelId = ncclSymkKernelId_AlltoAll_FullGin_LsaST;
+        nChannels = ncclSymkA2aChannels(comm, headTask->count, headTask->minCTAs, headTask->maxCTAs);
+        nWarps = ncclSymkMaxThreads / WARP_SIZE;
+      } else {
+        struct ncclTuningInput_t input;
+        input.comm = comm;
+        input.tuningMask = NCCL_TUNING_MASK_SYM_KERNELS;
+        if (effAlgMask != 0) {
+          uint64_t symkMask = effAlgMask & NCCL_TUNING_MASK_SYM_KERNELS;
+          if (symkMask != 0) input.tuningMask = symkMask;
+        }
+        input.func = headTask->func;
+        input.redOp = headTask->opHost;
+        input.devRedOp = symkOp;
+        input.datatype = headTask->datatype;
+        input.nBytes = countTotal * ncclTypeSize(headTask->datatype);
+        input.numPipeOps = 0;
+        input.count = headTask->count;
+        input.countMax = countMax;
+        input.nWorks = nWorks;
+        input.winRegType = headTask->winRegType;
+        input.symAligned16B = symBatchAligned16B(headTask);
+        input.minCTAs = headTask->minCTAs;
+        input.maxCTAs = headTask->maxCTAs;
+        input.CTAPolicy = headTask->CTAPolicy;
+        // Symmetric kernels use comm->symkState.hasLsaMultimem for multicast capability.
+        // input.nvlsSupport only gates NVLS/NVLS_TREE during general-kernel fallback tuning.
+        input.nvlsSupport =
+          ncclNvlsTransportEnabled(comm) &&
+          (ncclNvlsSupported(headTask->opDev.op, headTask->datatype) || headTask->func == ncclFuncAllGather);
+        NCCLCHECK(ncclGetCollNetSupport(comm, headTask, &input.collNetSupport));
+        NCCLCHECK(ncclGetRegBuff(comm, headTask, &input.regBuff));
+        struct ncclTuningResult_t bestTuning = NCCL_TUNING_RESULT_INIT;
+        NCCLCHECK(ncclTuningCompute(&input, &bestTuning));
+        kernelId = (ncclSymkKernelId)bestTuning.symKernelId;
+        nChannels = bestTuning.nChannels;
+        nWarps = bestTuning.nWarps;
       }
-      input.func = headTask->func;
-      input.redOp = headTask->opHost;
-      input.devRedOp = symkOp;
-      input.datatype = headTask->datatype;
-      input.nBytes = countTotal * ncclTypeSize(headTask->datatype);
-      input.numPipeOps = 0;
-      input.count = headTask->count;
-      input.countMax = countMax;
-      input.nWorks = nWorks;
-      input.winRegType = headTask->winRegType;
-      input.symAligned16B = symBatchAligned16B(headTask);
-      input.minCTAs = headTask->minCTAs;
-      input.maxCTAs = headTask->maxCTAs;
-      input.CTAPolicy = headTask->CTAPolicy;
-      // Symmetric kernels use comm->symkState.hasLsaMultimem for multicast capability.
-      // input.nvlsSupport only gates NVLS/NVLS_TREE during general-kernel fallback tuning.
-      input.nvlsSupport =
-        ncclNvlsTransportEnabled(comm) &&
-        (ncclNvlsSupported(headTask->opDev.op, headTask->datatype) || headTask->func == ncclFuncAllGather);
-      NCCLCHECK(ncclGetCollNetSupport(comm, headTask, &input.collNetSupport));
-      NCCLCHECK(ncclGetRegBuff(comm, headTask, &input.regBuff));
-      struct ncclTuningResult_t bestTuning = NCCL_TUNING_RESULT_INIT;
-      NCCLCHECK(ncclTuningCompute(&input, &bestTuning));
-      kernelId = (ncclSymkKernelId)bestTuning.symKernelId;
-      nChannels = bestTuning.nChannels;
-      nWarps = bestTuning.nWarps;
       task = headTask;
       // Hard-error only when the selection was symmetric-only (no general algorithm to fall
       // back to) and force is on; otherwise let the legacy fallback below run.
@@ -283,6 +296,7 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
   const char* funcName = ncclFuncToString(headTask->func);
   const char* kernelName = ncclSymkKernelIdToString(headTask->devFuncId);
   struct ncclSymkDevWorkArgs* argsBuf = NULL;
+  struct ncclSymkDevComm* kcomm = NULL;
 
   plan->isSymColl = true;
   plan->threadPerBlock = headTask->nWarps * WARP_SIZE;
@@ -407,7 +421,8 @@ ncclResult_t ncclSymmetricTaskScheduler(struct ncclComm* comm,
   if (remainCell < cellPerChannel) curChannel++;
   // At this point, curChannel indexes the first _empty_ channel.
 
-  memcpy(&argsBuf->kcomm, &comm->symkState.kcomm, sizeof(comm->symkState.kcomm));
+  kcomm = kernelId == ncclSymkKernelId_AlltoAll_FullGin_LsaST ? &comm->symkState.a2aKcomm : &comm->symkState.kcomm;
+  memcpy(&argsBuf->kcomm, kcomm, sizeof(*kcomm));
   plan->workBytes = totalCount * ncclTypeSize(headTask->datatype);
   // curChannel == 0 is not expected here (the caller ensures symTaskQueue is
   // non-empty), but guard it anyway to avoid the undefined behavior of shifting
